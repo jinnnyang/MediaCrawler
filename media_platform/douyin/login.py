@@ -103,7 +103,7 @@ class DouYinLogin(AbstractLogin):
                 # utils.logger.warn(f"[DouYinLogin] check_login_state waring: {e}")
                 await asyncio.sleep(0.1)
 
-        if cookie_dict.get("LOGIN_STATUS") == "1":
+        if cookie_dict.get("LOGIN_STATUS") == "1" or cookie_dict.get("login_time"):
             return True
 
         return False

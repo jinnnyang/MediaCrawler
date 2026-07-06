@@ -65,8 +65,21 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         ]
         self.playwright_page = playwright_page
         self.cookie_dict = cookie_dict
+        # 稳定的 19 位 webid：一次会话内固定，模拟真实浏览器的稳定设备 ID（不再每次请求随机）
+        self._stable_webid = self._gen_stable_webid()
         # Initialize proxy pool (from ProxyRefreshMixin)
         self.init_proxy_pool(proxy_ip_pool)
+
+    @staticmethod
+    def _gen_stable_webid() -> str:
+        """Generate a stable 19-digit web ID for the entire session lifetime.
+
+        Real Douyin browsers use a persistent 19-digit webid across all API requests.
+        Generating a fresh one per request (as the old get_web_id() did) is a strong
+        bot fingerprint. Freeze it at client construction instead.
+        """
+        import random as _r
+        return str(_r.randint(7_000_000_000_000_000_000, 7_999_999_999_999_999_999))
 
     async def __process_req_params(
         self,
@@ -79,46 +92,56 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         if not params:
             return
         headers = headers or self.headers
-        local_storage: Dict = await self.playwright_page.evaluate("() => window.localStorage")  # type: ignore
+
+        # 2026 更新：抖音已放弃 URL 层签名（a_bogus / msToken / X-Bogus）
+        # 风控完全下沉到 uifid（服务端下发的持久设备指纹）+ webid（稳定会话 ID）+ cookie 里的 bd_ticket_guard_* / s_v_web_id
+        # 参考：实测 /aweme/v1/web/general/search/single/ 等接口的真实浏览器请求均已不带 a_bogus
+        # 因此这里删除 a_bogus 拼装，改为对齐真实浏览器指纹参数
         common_params = {
             "device_platform": "webapp",
             "aid": "6383",
             "channel": "channel_pc_web",
-            "version_code": "190600",
-            "version_name": "19.6.0",
+            "version_code": "170400",
+            "version_name": "17.4.0",
             "update_version_code": "170400",
             "pc_client_type": "1",
+            "pc_libra_divert": "Windows",
+            "support_h265": "1",
+            "support_dash": "1",
             "cookie_enabled": "true",
             "browser_language": "zh-CN",
-            "browser_platform": "MacIntel",
-            "browser_name": "Chrome",
-            "browser_version": "125.0.0.0",
+            # 浏览器指纹：从 playwright 页面动态读取真实值，避免与实际浏览器不一致
+            "browser_platform": await self.playwright_page.evaluate("() => navigator.platform"),
+            "browser_name": await self.playwright_page.evaluate(
+                "() => (navigator.userAgent.match(/(Firefox|Chrome|Safari|Edge)/) || ['Chrome'])[0]"
+            ),
+            "browser_version": await self.playwright_page.evaluate(
+                "() => { const m = navigator.userAgent.match(/(Firefox|Chrome|Safari|Edge)\\/([\\d.]+)/); return m ? m[2] : '125.0.0.0'; }"
+            ),
             "browser_online": "true",
-            "engine_name": "Blink",
-            "os_name": "Mac OS",
-            "os_version": "10.15.7",
-            "cpu_core_num": "8",
-            "device_memory": "8",
-            "engine_version": "109.0",
+            "engine_name": await self.playwright_page.evaluate(
+                "() => navigator.userAgent.includes('Firefox') ? 'Gecko' : (navigator.userAgent.includes('WebKit') ? 'Blink' : 'Blink')"
+            ),
+            "engine_version": await self.playwright_page.evaluate(
+                "() => { const m = navigator.userAgent.match(/(Firefox|Chrome|Safari|Edge)\\/([\\d.]+)/); return m ? m[2] : '125.0.0.0'; }"
+            ),
+            "os_name": await self.playwright_page.evaluate(
+                "() => { const p = navigator.platform; if (p.includes('Win')) return 'Windows'; if (p.includes('Mac')) return 'Mac OS'; if (p.includes('Linux')) return 'Linux'; return 'Windows'; }"
+            ),
+            "os_version": await self.playwright_page.evaluate(
+                "() => { const m = navigator.userAgent.match(/(Windows NT|Mac OS X|Linux) ([\\d_.]+)/); return m ? m[2].replace(/_/g, '.') : '10'; }"
+            ),
+            "cpu_core_num": str(await self.playwright_page.evaluate("() => navigator.hardwareConcurrency || 8")),
+            "device_memory": str(await self.playwright_page.evaluate("() => navigator.deviceMemory || ''")),
             "platform": "PC",
-            "screen_width": "2560",
-            "screen_height": "1440",
-            'effective_type': '4g',
-            "round_trip_time": "50",
-            "webid": get_web_id(),
-            "msToken": local_storage.get("xmst"),
+            "screen_width": str(await self.playwright_page.evaluate("() => screen.width")),
+            "screen_height": str(await self.playwright_page.evaluate("() => screen.height")),
+            # 稳定设备指纹：从 cookie 里读服务端下发的 UIFID + s_v_web_id，替代原来每次随机的 get_web_id()
+            # UIFID 是抖音 2024 新增的核心设备指纹，实测所有 web API 都带此参数
+            "uifid": self.cookie_dict.get("UIFID") or self.cookie_dict.get("UIFID_TEMP") or "",
+            "webid": self._stable_webid,
         }
         params.update(common_params)
-        query_string = urllib.parse.urlencode(params)
-
-        # 20240927 a-bogus update (JS version)
-        post_data = {}
-        if request_method == "POST":
-            post_data = params
-
-        if "/v1/web/general/search" not in uri:
-            a_bogus = await get_a_bogus(uri, query_string, post_data, headers["User-Agent"], self.playwright_page)
-            params["a_bogus"] = a_bogus
 
     async def request(self, method, url, **kwargs):
         # Check whether the proxy has expired before each request
@@ -148,15 +171,17 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         return await self.request(method="POST", url=f"{self._host}{uri}", data=data, headers=headers)
 
     async def pong(self, browser_context: BrowserContext) -> bool:
+        # 优先认 localStorage.HasUserLogin（实测最可靠）
         local_storage = await self.playwright_page.evaluate("() => window.localStorage")
         if local_storage.get("HasUserLogin", "") == "1":
             return True
 
+        # 2026 更新：抖音已废弃 LOGIN_STATUS cookie，改用 login_time 时间戳标记登录态
         _, cookie_dict = await utils.convert_browser_context_cookies(
             browser_context,
             urls=self.cookie_urls,
         )
-        return cookie_dict.get("LOGIN_STATUS") == "1"
+        return bool(cookie_dict.get("login_time")) or cookie_dict.get("LOGIN_STATUS") == "1"
 
     async def update_cookies(self, browser_context: BrowserContext, urls: Optional[list[str]] = None):
         cookie_str, cookie_dict = await utils.convert_browser_context_cookies(
