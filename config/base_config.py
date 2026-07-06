@@ -66,7 +66,7 @@ CDP_DEBUG_PORT = 9222
 # 如果为空，系统会自动检测 Chrome/Edge 的安装路径
 # Windows 示例: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
 # macOS 示例: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-CUSTOM_BROWSER_PATH = ""
+CUSTOM_BROWSER_PATH = r"C:\Symbols\Chrome\App\Chrome-bin\chrome.exe"
 
 # 是否在 CDP 模式下启用无头模式
 # 注意：即使设置为 True，某些反检测功能在无头模式下可能无法正常工作
