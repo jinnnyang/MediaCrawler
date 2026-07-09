@@ -289,4 +289,111 @@ uv run python main.py --platform dy --lt cookie --type search --keywords "编程
 
 ---
 
+## Part 6 · 后续 · 评论接口 blocked 修复（2026-07-09）
+
+### 6.1 症状
+
+搜索接口 14 条视频落盘正常，但评论 `/aweme/v1/web/comment/list/` 全部 blocked：
+
+```
+2026-07-09 11:43:06 ERROR - [DouYinCrawler.get_comments] aweme_id: 7645206239718247714 get comments failed, error: account blocked
+2026-07-09 11:43:06 ERROR - request params incrr, response.text:
+```
+
+`response.text == ""` 触发爬虫的兜底 blocked 分支。抖音的实际响应：`HTTP 200` + `content-length: 0` + `bd-ticket-guard-result: 1101`。
+
+### 6.2 抓包 diff（不盲改）
+
+写了两个 CDP 探针**对比真实浏览器 vs 爬虫**（保留在 `scripts/probe_comment_*.py` 作诊断工具）：
+
+- `probe_comment_request.py` — JS 层 hook `window.fetch` / `XHR`，看 fetch init 视角
+- `probe_comment_full_headers.py` — CDP `Network.requestWillBeSentExtraInfo`，看 Chrome 发到线上的**完整头**
+
+发现两处差异：
+
+**差异 1：8 个 URL 参数缺失**（评论接口敏感，搜索接口不校验）
+```
+cut_version, pc_img_format, effective_type, downlink, round_trip_time,
+insert_ids, whale_cut_token, rcFT
+```
+
+**差异 2：5 个 `bd-ticket-guard-*` 请求头缺失**（根因）
+```
+bd-ticket-guard-client-data: <base64 P-256 签名>
+bd-ticket-guard-ree-public-key: <ECDH 公钥>
+bd-ticket-guard-version: 2
+bd-ticket-guard-web-sign-type: 1
+bd-ticket-guard-web-version: 2
+```
+
+解码 `bd-ticket-guard-client-data`：
+```json
+{
+  "ts_sign": "ts.2.34a96f1b50ffec43...",
+  "req_content": "ticket,path,timestamp",
+  "req_sign": "RLN8Hdf7fGtcNkv/Qx3T81NznM3huJ5fJTRTEIlYGLk=",
+  "timestamp": 1783568805
+}
+```
+
+这是抖音的 **bd-ticket-guard（bdtg）** 机制 —— 浏览器用**本地生成的 P-256 私钥**对 `ticket + path + timestamp` 签名，服务端用之前 handshake 得到的 `ree-public-key` 验证。私钥在浏览器 IndexedDB 里，签名逻辑封装在抖音 SDK 内。
+
+### 6.3 修复方案对比
+
+| 方案 | 说明 | 工作量 | 稳定性 |
+|---|---|---|---|
+| A | **让 Chrome 帮我们签名** — 用 playwright 页面的 `fetch()` 走浏览器通道 | ⭐ 低 | ⭐⭐⭐ 高 |
+| B | 抓一批真实签名 rotate | ⭐ 极低 | ❌ 差（timestamp 过期就废）|
+| C | Python 复现 P-256 签名算法 | ⭐⭐⭐⭐⭐ 极高 | ⭐⭐ 中（抖音会改）|
+
+**选 A** —— 既然爬虫已经在 CDP 接管的 Chrome 里跑 playwright，直接让 Chrome 发请求。
+
+### 6.4 实现
+
+新增 `media_platform/douyin/client.py::_browser_fetch_json()` 方法：
+
+```python
+async def _browser_fetch_json(self, method, url, params=None, headers=None):
+    """委托给 playwright 页面的 fetch API，Chrome 自动加 bd-ticket-guard-* 头。"""
+    # 转成同源相对路径，合并 params 到 querystring
+    # 只保留少量业务头（uifid, accept），Cookie/UA/Referer 让 Chrome 自己填
+    result = await self.playwright_page.evaluate("""
+        async (args) => {
+            const resp = await fetch(args.url, {
+                method: args.method,
+                headers: args.headers,
+                credentials: 'include'
+            });
+            return { status: resp.status, text: await resp.text() };
+        }
+    """, {"url": rel, "method": method, "headers": browser_headers})
+    return json.loads(result["text"])
+```
+
+在 `request()` 里检测 `/comment/list` → 走这条通道；其他接口仍走 httpx。
+
+同时**保留** URL 参数补齐（8 个新参数 + `headers["uifid"]`）—— 服务端会同时校验多层，冗余点安全。
+
+### 6.5 端到端验证
+
+```
+2026-07-09 11:55:22 [DouYinCrawler.start] Douyin Crawler finished
+data/douyin/jsonl/search_contents_2026-07-09.jsonl: 14 行 (视频)
+data/douyin/jsonl/search_comments_2026-07-09.jsonl: 135 行 (评论)
+```
+
+零 blocked，14 个视频全部拿到评论。
+
+### 6.6 Part 5 教训的补充
+
+7. **抖音的风控是分层的**：搜索接口只查 uifid，评论接口加了一层 bd-ticket-guard 客户端签名。**不能"改一个接口，全平台通"**，每类接口都要抓包 diff。
+
+8. **抓包 diff 优先于盲改**：如果一开始直接猜是 Referer / URL 编码问题去改，会浪费半天。用 CDP 网络域抓包 → diff → 定位，30 分钟拿到根因。
+
+9. **"让浏览器自己签名"是逆向的通用捷径**：任何走 CDP + playwright 的爬虫，遇到复杂签名（P-256、WBI、msToken...），先想能不能把 fetch 委托给浏览器上下文，往往能省下 10 倍工作量。
+
+10. **`response.text == ""` 不一定是账号 blocked**：可能是签名校验失败、bd-ticket-guard-result 报错、频控（都会静默返回空 body）。需要抓响应头才能区分。
+
+---
+
 **End of Walkthrough.**
