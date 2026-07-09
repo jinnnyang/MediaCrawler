@@ -140,12 +140,37 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             # UIFID 是抖音 2024 新增的核心设备指纹，实测所有 web API 都带此参数
             "uifid": self.cookie_dict.get("UIFID") or self.cookie_dict.get("UIFID_TEMP") or "",
             "webid": self._stable_webid,
+            # 2026-07-06 更新：评论接口 /aweme/v1/web/comment/list 对以下参数敏感，
+            # 真实浏览器都会带；缺失时会触发 blocked。搜索接口不校验但带上也无害。
+            "cut_version": "1",
+            "pc_img_format": "webp",
+            "effective_type": "4g",
+            "downlink": "10",
+            "round_trip_time": "50",
+            "insert_ids": "",
+            "whale_cut_token": "",
+            "rcFT": "",
         }
         params.update(common_params)
+
+        # 2026-07-06 关键发现：抖音评论接口除了 URL query 里的 uifid，
+        # 还校验 HTTP 请求头 uifid。这是评论接口 blocked 的根因。
+        # 参考实测：真实浏览器 XHR 显式设置 `uifid` header，服务端严格校验。
+        uifid_val = self.cookie_dict.get("UIFID") or self.cookie_dict.get("UIFID_TEMP") or ""
+        if uifid_val:
+            headers["uifid"] = uifid_val
 
     async def request(self, method, url, **kwargs):
         # Check whether the proxy has expired before each request
         await self._refresh_proxy_if_expired()
+
+        # 2026-07-09：评论接口（/comment/list, /comment/list/reply）需要 bd-ticket-guard-* 客户端签名头
+        # （抖音服务端会做 P-256 椭圆曲线签名校验，Python 侧复现工作量极大）
+        # 解决方案：把 fetch 委托给已注入到 playwright 页面的浏览器上下文，
+        # Chrome 会自动加 bd-ticket-guard-client-data / ree-public-key 等头。
+        # 参考：hermes-verify-plan-a-browser-fetch.py 已实测通过。
+        if "/comment/list" in url and self.playwright_page is not None:
+            return await self._browser_fetch_json(method, url, kwargs.get("params"), kwargs.get("headers"))
 
         async with make_async_client(proxy=self.proxy) as client:
             response = await client.request(method, url, timeout=self.timeout, **kwargs)
@@ -156,6 +181,66 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             return response.json()
         except Exception as e:
             raise DataFetchError(f"{e}, {response.text}")
+
+    async def _browser_fetch_json(self, method: str, url: str,
+                                   params: Optional[Dict] = None,
+                                   headers: Optional[Dict] = None) -> Dict:
+        """Delegate a request to the playwright page's fetch API.
+
+        Chrome auto-populates bd-ticket-guard-* signature headers here,
+        which抖音 evaluates server-side. Response is parsed as JSON.
+        Falls back to raising DataFetchError on empty body (blocked).
+        """
+        import urllib.parse as _up
+        # Convert absolute host URL into a same-origin path (so browser treats it as same-site)
+        parsed = _up.urlparse(url)
+        rel = parsed.path
+        # Merge params into query string
+        query_pairs = _up.parse_qsl(parsed.query, keep_blank_values=True)
+        if params:
+            for k, v in params.items():
+                query_pairs.append((k, "" if v is None else str(v)))
+        if query_pairs:
+            rel = rel + "?" + _up.urlencode(query_pairs, doseq=True)
+
+        # Only pass headers that are meaningful for browser fetch (Chrome adds the rest)
+        # Skip Cookie/User-Agent/Host/Origin/Referer/Content-Type — browser fills them.
+        browser_headers: Dict[str, str] = {"accept": "application/json, text/plain, */*"}
+        if headers:
+            for k, v in headers.items():
+                if k.lower() in ("uifid",):
+                    browser_headers[k] = v
+
+        js = """
+        async (args) => {
+            try {
+                const resp = await fetch(args.url, {
+                    method: args.method,
+                    headers: args.headers,
+                    credentials: 'include'
+                });
+                const text = await resp.text();
+                return { status: resp.status, text: text };
+            } catch (e) {
+                return { error: String(e) };
+            }
+        }
+        """
+        result = await self.playwright_page.evaluate(js, {
+            "url": rel,
+            "method": method,
+            "headers": browser_headers,
+        })
+        if result.get("error"):
+            raise DataFetchError(f"browser fetch error: {result['error']}")
+        text = result.get("text", "")
+        if not text or text == "blocked":
+            utils.logger.error(f"[browser_fetch_json] empty/blocked. url={rel[:200]}")
+            raise DataFetchError(f"account blocked, response.text: {text!r}")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            raise DataFetchError(f"JSON decode failed: {e}, body={text[:200]!r}")
 
     async def get(self, uri: str, params: Optional[Dict] = None, headers: Optional[Dict] = None):
         """
