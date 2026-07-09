@@ -1,14 +1,20 @@
 # PRD-001 · MediaCrawler 断点续传 & 文件系统状态管理
 
-> **状态**：Draft v0.2（已评审，待实现）
-> **作者**：hermes-agent 协助
+> **状态**：v1.0 (已评审通过，待实现)
+> **作者**：hermes-agent & Antigravity 协助
 > **创建日期**：2026-07-09
-> **最后更新**：2026-07-09（v0.2：吸收评审意见 Q1-Q8）
+> **最后更新**：2026-07-09（v1.0：解决评审中指出的3个关键问题及细节优化）
 > **依赖任务**：无（本 PRD 是 PRD-002 的前置）
 > **关联任务**：PRD-002 单博主视频转文字流水线
 
 ## Changelog
 
+- **v1.0**（2026-07-09）：
+  - 修复跨午夜 `--work-hours` (如 `"22:00-02:00"`) 的判定边界与 sleep 目标时长计算逻辑。
+  - 优化 `manifest.jsonl` 损坏行读取容错：采用"截断至最后一个有效行 + 配合 cursor 续拉去重"策略，杜绝数据遗漏风险。
+  - 统一 `Stage.fn` 签名为 `async def fn(...)`，主循环及相关工具全面适配异步。
+  - 明确 sidecar 中的 `sha256` 仅在写入时计算一次，Skip 判断时直接检查 `.done` sidecar 的 existence 和 sanity_check 值，不重复计算。
+  - 废除失败记录 `_record_failure` 中的"调用栈推断 stage"逻辑，改为显式传入 `stage: str` 参数。
 - **v0.2**（2026-07-09）：
   - Q1: 引入 `.done` sidecar + sanity check 区分"完成"与"坏产物"
   - Q2: 移除 `Stage.dep`，统一 `fn(item_id, workdir) -> Path` 签名，依赖关系由 stage 自己读
@@ -137,6 +143,10 @@ sidecar 内容（JSON）：
 - **完成** = 产物文件存在 **且** sidecar 存在 **且** `sanity_check == "ok"`
 - 缺 sidecar 或 sanity 失败 → 视为未完成，重新跑该 stage（旧产物会被 tmp+rename 原子覆盖）
 
+**性能优化（性能与开销平衡）**：
+- `sha256` 字段仅在 stage 完成、写入 sidecar 时计算一次并持久化。
+- 之后的 skip/resume 幂等判断，**直接读取并验证 sidecar 文件的内容（只检查 `sanity_check == "ok"`）即可，绝对不可重复计算大文件 (如 mp4) 的 sha256**，避免不必要的 I/O 吞吐损耗。
+
 #### 4.1.2 每 stage 的 sanity check 最小要求
 
 框架强制每个 stage fn 返回前跑一个 sanity check，不通过就抛 `StageSanityError`（走 failed/ 分支）：
@@ -153,16 +163,22 @@ sidecar 内容（JSON）：
 #### 4.1.3 幂等 stage 函数模板
 
 ```python
-def stage_download(item_id: str, workdir: Path) -> Path:
+async def stage_download(item_id: str, workdir: Path) -> Path:
     """Idempotent: skip if .done sidecar present, else produce + verify + write sidecar."""
     out = workdir / "video" / f"{item_id}.mp4"
     done = out.with_suffix(out.suffix + ".done")
-    if done.exists() and json.loads(done.read_text())["sanity_check"] == "ok":
-        return out                                # ← 短路
+    if done.exists():
+        try:
+            async with aiofiles.open(done, "r") as f:
+                sidecar_data = json.loads(await f.read())
+            if sidecar_data.get("sanity_check") == "ok":
+                return out                            # ← 短路 (直接返回，不重算 sha256)
+        except Exception:
+            pass
     # ... 实际下载逻辑（原子写）...
-    _atomic_stream_download(url, out)
-    _verify_video_sanity(out)                     # 不通过则抛 StageSanityError
-    _write_done_sidecar(out, stage="video", extra={"duration_ms": elapsed_ms})
+    await _atomic_stream_download(url, out)
+    await _verify_video_sanity(out)                  # 不通过则抛 StageSanityError
+    await _write_done_sidecar(out, stage="video", extra={"duration_ms": elapsed_ms})
     return out
 ```
 
@@ -170,17 +186,20 @@ def stage_download(item_id: str, workdir: Path) -> Path:
 
 ```python
 for item_id in manifest:
-    if _is_stage_done(workdir / "md", item_id):
+    if await _is_stage_done(workdir / "md", item_id):
         continue                                      # 最终产物已完成 → 整条跳过
-    if _is_in_failed(item_id, workdir) and not retry_failed:
+    if await _is_in_failed(item_id, workdir) and not retry_failed:
         continue                                      # Q3: 默认跳过 failed
     try:
-        stage_download(item_id, workdir)              # Q2: 各 stage 自己读 workdir 拿输入
-        stage_extract_audio(item_id, workdir)
-        stage_stt(item_id, workdir)
-        stage_render_md(item_id, workdir)
+        # Q2: 各 stage 自己读 workdir 拿输入，统一 async 异步调用
+        await stage_download(item_id, workdir)
+        await stage_extract_audio(item_id, workdir)
+        await stage_stt(item_id, workdir)
+        await stage_render_md(item_id, workdir)
     except (StageSanityError, Exception) as e:
-        _record_failure(item_id, e, workdir)
+        # Q3 修正：显式传入 stage 参数，而非脆弱的调用栈推断
+        current_stage = _determine_current_stage(e)   # 捕获异常处的 stage 标识
+        await _record_failure(item_id, e, current_stage, workdir)
 ```
 
 ### 4.2 原子写入（防半截文件）
@@ -229,6 +248,36 @@ async def _atomic_stream_download(url: str, dst: Path) -> None:
 **恢复逻辑**：
 
 ```python
+def _read_manifest_ids(manifest_file: Path) -> set[str]:
+    """读取 manifest.jsonl 所有的 id，自动处理末尾半行损坏并安全截断自愈"""
+    seen = set()
+    valid_lines = []
+    has_corruption = False
+    
+    if not manifest_file.exists():
+        return seen
+
+    with open(manifest_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line_str = line.strip()
+            if not line_str:
+                continue
+            try:
+                item = json.loads(line_str)
+                seen.add(item["aweme_id"])
+                valid_lines.append(line_str)
+            except json.JSONDecodeError:
+                # 发现损坏行（通常在文件末尾），立即停止读取，准备截断自愈
+                logging.warning(f"Detected corrupt line in manifest: {line_str}. Will truncate to recovery point.")
+                has_corruption = True
+                break
+                
+    if has_corruption:
+        # 将文件回滚写入到最后一个健康的行（原子写入）
+        _atomic_write_text(manifest_file, "\n".join(valid_lines) + "\n")
+        
+    return seen
+
 def fetch_manifest(workdir: Path, fetch_page_fn):
     cursor_file = workdir / "manifest.cursor.json"
     manifest_file = workdir / "manifest.jsonl"
@@ -250,23 +299,27 @@ def fetch_manifest(workdir: Path, fetch_page_fn):
     return manifest_file
 ```
 
-**关键点**：先 append manifest.jsonl，再 write cursor.json。即使 append 后崩溃，下次跑靠 `seen` 集合去重也能正确恢复。
+**关键点**：
+1. **先 append manifest，再 write cursor**：即使 append 后崩溃，下次跑靠 `seen` 集合去重也能正确恢复。
+2. **损坏行自愈**：读取 `manifest.jsonl` 时，若中途遭遇 `JSONDecodeError`，表明文件因异常断电发生末尾半行损坏。读取器会**安全截断并丢弃损坏的最后一行**，记录 Warning 并保留之前解析成功的所有有效行。主程序下一次运行拉取清单时，会根据 `cursor.json` 内的进度以及 `seen` 去重机制**自动把该损坏行对应的条目重新拉取下来**，杜绝数据遗漏的静默丢失风险。
+
 
 ### 4.4 失败隔离（Q3 修订）
 
 **每个 item 的失败不阻塞其他 item**：
 
 ```python
-def _record_failure(item_id: str, err: Exception, workdir: Path) -> None:
+async def _record_failure(item_id: str, err: Exception, stage: str, workdir: Path) -> None:
     fail = workdir / "failed" / f"{item_id}.json"
     fail.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_json(fail, {
+    # 显式传入 stage，消除调用栈推算的不确定性
+    await _atomic_write_json(fail, {
         "item_id": item_id,
         "error": str(err),
         "error_type": type(err).__name__,
         "traceback": traceback.format_exc(),
         "failed_at": datetime.now().isoformat(),
-        "stage": _current_stage_hint(),           # 从调用栈或显式传入
+        "stage": stage,
         "attempt": _count_attempts(item_id, workdir) + 1,
     })
 ```
@@ -297,11 +350,22 @@ failed/
 - **批内串行**（避免同时下载 10 个 mp4 打爆网络 / 触发风控）
 - **批间 sleep**：由 `--pace-seconds P`（默认 `5.0`）单参数驱动，详见 §10.1
 - **工作时间窗口**（MVP）：`--work-hours "09:00-24:00"`（默认，可用 `--work-hours ""` 关闭）
-  - 主循环每次进入下一批前检查当前时间
-  - 越过窗口右边界 → 计算距下一个左边界的秒数，sleep 到早晨自动继续
-  - 用 `run.log` 记录 `stage=sleep kind=work_hours until=2026-07-10T09:00:00Z`
-  - **不打断正在跑的 item**：只在批与批之间检查，避免半途中断留 tmp
-  - 决策依据：抖音风控对夜间自动化的敏感度高，PRD-002 200+ 条必然过夜，硬编码窗口比让用户凌晨 3 点被封更好
+  - 支持跨午夜时间窗口判定（如 `"22:00-02:00"`，即右边界 < 左边界）。
+  - **时间判定逻辑**：
+    ```python
+    def is_within_hours(now_time: time, start: time, end: time) -> bool:
+        if start <= end:
+            return start <= now_time < end
+        else: # 跨午夜
+            return now_time >= start or now_time < end
+    ```
+  - **挂起等待计算**：
+    - 主循环在批与批之间检查当前时间。若处于工作时间窗口外，计算距离下一个左边界（`start`）的秒数，并 Sleep 挂起。
+    - 若 `start <= end`（普通窗口）且 `now_time >= end`，则下一个左边界是明天的 `start`。
+    - 若 `start > end`（跨午夜窗口）且 `now_time >= end` 且 `now_time < start`，下一个左边界是今天的 `start`。
+    - 挂起时，往 `run.log` 记录一行 `stage=sleep kind=work_hours until=YYYY-MM-DDTHH:MM:SSZ`。
+  - **不打断正在跑的 item**：只在批与批之间检查，避免半途中断留 tmp。
+  - 决策依据：抖音风控对夜间自动化的敏感度高，PRD-002 200+ 条必然过夜，硬编码窗口比让用户凌晨 3 点被封更好。
 - **进度打印**：见 §4.6.2
 
 ### 4.6 日志（Q4 修订：结构化 vs 人读拆分）
@@ -458,7 +522,7 @@ scripts/common/resume/
 ### 6.1 `pipeline.run_pipeline()` 签名（Q2 修订）
 
 ```python
-def run_pipeline(
+async def run_pipeline(
     workdir: Path,
     manifest_path: Path,
     stages: list[Stage],           # [Stage("video", download_fn, "mp4"), Stage("audio", extract_fn, "mp3"), ...]
@@ -469,10 +533,8 @@ def run_pipeline(
     max_retries: int = 3,
 ) -> RunSummary:
     """
-    Runs all items in manifest through the given stages.
-    Each stage is idempotent (skip if .done sidecar present with sanity_check==ok).
-    Each item's failure is isolated to failed/{item_id}.json (see §4.4).
-    Runs under a single-process lock (see §4.7).
+    异步调度主循环。
+    每个 stage 均为 async 签名。如果使用非原生异步的同步操作（如调用 ffmpeg），需用 aiofiles 或 asyncio.to_thread 包装。
     """
 ```
 
@@ -482,7 +544,7 @@ def run_pipeline(
 @dataclass
 class Stage:
     name: str                                 # "video" / "audio" / "transcript" / "md"
-    fn: Callable[[str, Path], Path]           # (item_id, workdir) -> output_path
+    fn: Callable[[str, Path], Awaitable[Path]]  # 异步函数 (item_id, workdir) -> Path
     ext: str                                  # "mp4" / "mp3" / "txt" / "md"
     # ← 移除 dep 字段（v0.2）
     #   原因：stage_render_md 需要 transcript 文本 + manifest 里的原始元数据（标题、发布时间），
@@ -544,7 +606,7 @@ def test_interrupt_at_random_ticks():
 - SIGTERM 在 tmp write 中间（rename 前）→ 下次跑 tmp 被清理，产物不存在，重跑
 - SIGTERM 在 rename 后 sidecar 写之前 → 产物存在但缺 sidecar，下次跑重新执行 fn
 - SIGTERM 在 sidecar 写到一半（tmp）→ sidecar 也走原子写，下次跑发现缺 sidecar 重跑
-- SIGTERM 在 manifest append 中途 → jsonl 可能有半行，用 `try/except json.JSONDecodeError` 跳过坏行
+- SIGTERM 在 manifest append 中途 → jsonl 可能有半行，用 `_read_manifest_ids` 中内置的 `JSONDecodeError` 拦截并执行安全截断自愈，续拉去重。
 
 ### 7.4 手动 QA
 
