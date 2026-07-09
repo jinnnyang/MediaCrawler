@@ -1,14 +1,19 @@
 # PRD-001 · MediaCrawler 断点续传 & 文件系统状态管理
 
-> **状态**：v1.0 (已评审通过，待实现)
+> **状态**：v1.1 (已评审通过，待实现)
 > **作者**：hermes-agent & Antigravity 协助
 > **创建日期**：2026-07-09
-> **最后更新**：2026-07-09（v1.0：解决评审中指出的3个关键问题及细节优化）
+> **最后更新**：2026-07-09（v1.1：吸收 v1.0 评审的 4 项架构建议）
 > **依赖任务**：无（本 PRD 是 PRD-002 的前置）
 > **关联任务**：PRD-002 单博主视频转文字流水线
 
 ## Changelog
 
+- **v1.1**（2026-07-09）：
+  - Q_new_1: 拆分 manifest **读/写职责** —— `_read_manifest_ids_safe` 纯读返回 `(seen, has_corruption)`，截断修复由 `fetch_manifest` 显式触发；`mc_status` 只读永不改文件。
+  - Q_new_3: 补充 **async 化实施原则** —— async 是为兼容主循环 event loop，不是极致性能；CPU-only 保持同步，小 JSON 用 `asyncio.to_thread` 而非强上 aiofiles。
+  - Q_new_4: 明确 sidecar `sha256` 为**归档元数据**，不参与 skip 判定（防止未来维护者误加"skip 时对比 sha256"抹掉 v1.0 优化）。
+  - Q_new_5: 主循环改为**分段赋值 stage + try/except**，`stage` 变量在编译期可确定，废除 `_determine_current_stage(e)` 从异常反推的逻辑（跟 v0.2 废除调用栈推断同构问题）。
 - **v1.0**（2026-07-09）：
   - 修复跨午夜 `--work-hours` (如 `"22:00-02:00"`) 的判定边界与 sleep 目标时长计算逻辑。
   - 优化 `manifest.jsonl` 损坏行读取容错：采用"截断至最后一个有效行 + 配合 cursor 续拉去重"策略，杜绝数据遗漏风险。
@@ -147,6 +152,11 @@ sidecar 内容（JSON）：
 - `sha256` 字段仅在 stage 完成、写入 sidecar 时计算一次并持久化。
 - 之后的 skip/resume 幂等判断，**直接读取并验证 sidecar 文件的内容（只检查 `sanity_check == "ok"`）即可，绝对不可重复计算大文件 (如 mp4) 的 sha256**，避免不必要的 I/O 吞吐损耗。
 
+**⚠️ sidecar `sha256` 字段的定位（Q_new_4，v1.1 补丁）**：
+- `sha256` 是**归档元数据（archival metadata）**，用于事后人工排查（例：手动核对某个 `.mp4` 是否被外部工具替换、跨机器搬运校验完整性）。
+- **不参与** skip / resume 判定。skip 的判定条件**只有一条**：`sanity_check == "ok"`。
+- 未来维护 sidecar 逻辑时，**禁止**在 skip 分支里添加类似"若 sha256 不匹配则重跑"的检查——那会把 v1.0 的性能优化抹掉，大文件每次 resume 都要重算 hash。
+
 #### 4.1.2 每 stage 的 sanity check 最小要求
 
 框架强制每个 stage fn 返回前跑一个 sanity check，不通过就抛 `StageSanityError`（走 failed/ 分支）：
@@ -190,17 +200,32 @@ for item_id in manifest:
         continue                                      # 最终产物已完成 → 整条跳过
     if await _is_in_failed(item_id, workdir) and not retry_failed:
         continue                                      # Q3: 默认跳过 failed
+
+    # Q_new_5 (v1.1): 分段赋值 stage，编译期即确定当前阶段名，
+    # 抛错后直接把 stage 变量传给 _record_failure，
+    # 废除从异常调用栈或异常对象反推 stage 的脆弱逻辑。
+    stage = "init"
     try:
-        # Q2: 各 stage 自己读 workdir 拿输入，统一 async 异步调用
-        await stage_download(item_id, workdir)
-        await stage_extract_audio(item_id, workdir)
-        await stage_stt(item_id, workdir)
-        await stage_render_md(item_id, workdir)
+        stage = "video";       await stage_download(item_id, workdir)
+        stage = "audio";       await stage_extract_audio(item_id, workdir)
+        stage = "transcript";  await stage_stt(item_id, workdir)
+        stage = "md";          await stage_render_md(item_id, workdir)
     except (StageSanityError, Exception) as e:
-        # Q3 修正：显式传入 stage 参数，而非脆弱的调用栈推断
-        current_stage = _determine_current_stage(e)   # 捕获异常处的 stage 标识
-        await _record_failure(item_id, e, current_stage, workdir)
+        await _record_failure(item_id, e, stage, workdir)
 ```
+
+**动态 stage 列表（`run_pipeline` 内部实际调度形式）**：
+
+```python
+for stage_def in stages:                              # stages: list[Stage] 由调用方传入
+    try:
+        await stage_def.fn(item_id, workdir)
+    except (StageSanityError, Exception) as e:
+        await _record_failure(item_id, e, stage_def.name, workdir)
+        break                                          # 该 item 中断后续 stage，其他 item 继续
+```
+
+上面两种写法二选一：**手写主循环**用分段赋值，**框架 `run_pipeline`** 用循环调度。两种都保持 `stage` 在异常时**已知且明确**。
 
 ### 4.2 原子写入（防半截文件）
 
@@ -248,14 +273,19 @@ async def _atomic_stream_download(url: str, dst: Path) -> None:
 **恢复逻辑**：
 
 ```python
-def _read_manifest_ids(manifest_file: Path) -> set[str]:
-    """读取 manifest.jsonl 所有的 id，自动处理末尾半行损坏并安全截断自愈"""
-    seen = set()
-    valid_lines = []
+def _read_manifest_ids_safe(manifest_file: Path) -> tuple[set[str], list[str], bool]:
+    """
+    纯读函数（Q_new_1，v1.1）：
+      - 只解析 manifest.jsonl，返回 (seen_ids, valid_lines, has_corruption)
+      - **绝对不修改文件** —— 供 mc_status 等只读场景直接调用
+      - 遇到损坏行立即 break（append 模式下损坏只可能在文件末尾）
+    """
+    seen: set[str] = set()
+    valid_lines: list[str] = []
     has_corruption = False
-    
+
     if not manifest_file.exists():
-        return seen
+        return seen, valid_lines, has_corruption
 
     with open(manifest_file, "r", encoding="utf-8") as f:
         for line in f:
@@ -267,16 +297,26 @@ def _read_manifest_ids(manifest_file: Path) -> set[str]:
                 seen.add(item["aweme_id"])
                 valid_lines.append(line_str)
             except json.JSONDecodeError:
-                # 发现损坏行（通常在文件末尾），立即停止读取，准备截断自愈
-                logging.warning(f"Detected corrupt line in manifest: {line_str}. Will truncate to recovery point.")
+                logging.warning(
+                    f"Detected corrupt line in manifest at position {f.tell()}: "
+                    f"{line_str[:100]}. Will stop reading here."
+                )
                 has_corruption = True
                 break
-                
-    if has_corruption:
-        # 将文件回滚写入到最后一个健康的行（原子写入）
-        _atomic_write_text(manifest_file, "\n".join(valid_lines) + "\n")
-        
-    return seen
+
+    return seen, valid_lines, has_corruption
+
+
+def _truncate_manifest_to_valid(manifest_file: Path, valid_lines: list[str]) -> None:
+    """
+    显式写函数（Q_new_1，v1.1）：
+      - 仅当 fetch_manifest 等写路径确认要修复损坏时才调用
+      - 原子重写文件到最后一个健康行
+      - mc_status 等只读工具不得调用此函数
+    """
+    _atomic_write_text(manifest_file, "\n".join(valid_lines) + "\n")
+    logging.warning(f"Manifest {manifest_file} truncated to {len(valid_lines)} valid lines.")
+
 
 def fetch_manifest(workdir: Path, fetch_page_fn):
     cursor_file = workdir / "manifest.cursor.json"
@@ -286,7 +326,14 @@ def fetch_manifest(workdir: Path, fetch_page_fn):
     if not state["has_more"]:
         return manifest_file              # 全量已拉完
 
-    seen = _read_manifest_ids(manifest_file)
+    # 纯读 → 拿到 seen 集合和损坏标记
+    seen, valid_lines, has_corruption = _read_manifest_ids_safe(manifest_file)
+
+    # Q_new_1 (v1.1)：只有 fetch_manifest 这种"要向 manifest 写"的路径
+    # 才对损坏做截断修复；纯读工具（mc_status）永不触发。
+    if has_corruption:
+        _truncate_manifest_to_valid(manifest_file, valid_lines)
+
     while state["has_more"]:
         page, next_cursor = fetch_page_fn(state["max_cursor"])
         new_items = [it for it in page if it["aweme_id"] not in seen]
@@ -301,7 +348,11 @@ def fetch_manifest(workdir: Path, fetch_page_fn):
 
 **关键点**：
 1. **先 append manifest，再 write cursor**：即使 append 后崩溃，下次跑靠 `seen` 集合去重也能正确恢复。
-2. **损坏行自愈**：读取 `manifest.jsonl` 时，若中途遭遇 `JSONDecodeError`，表明文件因异常断电发生末尾半行损坏。读取器会**安全截断并丢弃损坏的最后一行**，记录 Warning 并保留之前解析成功的所有有效行。主程序下一次运行拉取清单时，会根据 `cursor.json` 内的进度以及 `seen` 去重机制**自动把该损坏行对应的条目重新拉取下来**，杜绝数据遗漏的静默丢失风险。
+2. **损坏行自愈（Q_new_1 v1.1 拆分职责）**：读取 `manifest.jsonl` 时若中途遭遇 `JSONDecodeError`，表明文件因异常断电发生末尾半行损坏。
+   - **`_read_manifest_ids_safe`** 是**纯读**函数：只返回 `(seen, valid_lines, has_corruption)`，**从不修改文件**。`mc_status` 等只读工具直接用此函数看进度。
+   - **`_truncate_manifest_to_valid`** 是**显式写**函数：只有 `fetch_manifest` 这种"本来就要向 manifest 写"的调用路径，在拿到 `has_corruption=True` 时才主动调用截断修复。
+   - 修复后，`fetch_manifest` 会根据 `cursor.json` 内的进度和 `seen` 去重机制**自动把该损坏行对应的条目重新拉取下来**，杜绝数据遗漏的静默丢失风险。
+   - 这样的读/写分层避免了"用户跑 `mc_status` 看一眼进度反而把 manifest 改了"的意外副作用。
 
 
 ### 4.4 失败隔离（Q3 修订）
@@ -537,6 +588,21 @@ async def run_pipeline(
     每个 stage 均为 async 签名。如果使用非原生异步的同步操作（如调用 ffmpeg），需用 aiofiles 或 asyncio.to_thread 包装。
     """
 ```
+
+#### 6.1.1 Async 化实施原则（Q_new_3，v1.1 新增）
+
+`async` 是为了**兼容 MediaCrawler 主循环的 asyncio event loop**（playwright + httpx 天然异步，同步 stage 会 block 整个循环），**不是**追求极致 IOPS。请按以下分档处理：
+
+| 场景 | 推荐做法 | 反例（禁止） |
+|---|---|---|
+| **原生异步 I/O**（httpx.stream 下载、STT API HTTP 调用、playwright 抓页） | 直接 `async / await` | 不需要 |
+| **子进程调用**（ffmpeg 提音频、ffprobe 探视频） | `asyncio.create_subprocess_exec()` | `subprocess.run()`（block loop） |
+| **小文件写**（`_record_failure` 的 <1KB JSON、`.done` sidecar） | `await asyncio.to_thread(_sync_write_json, path, data)` | 硬上 `aiofiles.open()` —— 引入依赖但只写几百字节，得不偿失 |
+| **大文件流式下载/写入** | `aiofiles.open() + async for chunk` | 一次 `read_bytes()` 进内存 |
+| **CPU-only 操作**（字符串拼接生成 md、`sha256` hash） | **保持同步**（普通 `def`） | 强加 `async` 只是把 CPU 阻塞包装了一层壳 |
+| **filelock 锁获取** | `await asyncio.to_thread(lock.acquire, timeout=0)` | 直接 `with lock:`（block loop） |
+
+**判断准则**：一个操作若 P99 耗时 < 1ms，用同步；若可能 > 10ms 且是 I/O，走 async。中间灰色地带（1-10ms）优先同步，简化代码。
 
 `Stage` 数据类（**Q2**：删掉 `dep` 字段。每个 stage 函数自己从 workdir 读需要的输入 —— 上一 stage 的产物、manifest.jsonl 里的元数据等。框架只管调度，不做依赖推断）：
 
