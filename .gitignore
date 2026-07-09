@@ -184,3 +184,11 @@ debug_tools
 
 database/*.db
 .omx/
+
+# AI 开发工具产物（GitNexus / Claude / Cursor / GitHub Copilot 等生成的项目元数据）
+.claude/
+AGENTS.md
+CLAUDE.md
+.cursorrules
+.github/copilot-instructions.md
+.gitnexus/
