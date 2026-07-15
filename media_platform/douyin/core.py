@@ -19,6 +19,7 @@
 
 import asyncio
 import os
+import pathlib
 import random
 from asyncio import Task
 from typing import Any, Dict, List, Optional, Tuple
@@ -463,6 +464,22 @@ class DouYinCrawler(AbstractCrawler):
         if not config.ENABLE_GET_MEIDAS:
             return
         aweme_id = aweme_item.get("aweme_id")
+
+        # 2026-07-15: True incremental — if the mp4 for this aweme is already
+        # on disk, skip the HTTP download entirely (not just the file write).
+        # Path here MUST mirror DouYinVideo.make_save_file_name so the check
+        # is consistent with the store layer.
+        video_store_root = (
+            f"{config.SAVE_DATA_PATH}/douyin/videos"
+            if config.SAVE_DATA_PATH else
+            "data/douyin/videos"
+        )
+        expected_path = pathlib.Path(video_store_root) / str(aweme_id) / "video.mp4"
+        if expected_path.exists():
+            utils.logger.info(
+                f"[DouYinCrawler.get_aweme_video] mp4 already downloaded, skip HTTP: {expected_path}"
+            )
+            return
 
         # The video URL will always exist, but when it is a short video type, the file is actually an audio file.
         video_download_url: str = douyin_store._extract_video_download_url(aweme_item)

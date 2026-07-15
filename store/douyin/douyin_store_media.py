@@ -124,6 +124,14 @@ class DouYinVideo(AbstractStoreVideo):
         """
         pathlib.Path(self.video_store_path + "/" + aweme_id).mkdir(parents=True, exist_ok=True)
         save_file_name = self.make_save_file_name(aweme_id, extension_file_name)
+        # 2026-07-15: existence-based resume — if the file was already written by
+        # a prior run, don't clobber it. Note: this skips the WRITE only; the
+        # caller has already paid the HTTP cost for video_content. For true
+        # download-time skip, add a pathlib.Path(...).exists() check up in
+        # DouYinCrawler.get_aweme_video before calling dy_client.get_aweme_media.
+        if pathlib.Path(save_file_name).exists():
+            utils.logger.info(f"[DouYinVideoStoreImplement.save_video] already exists, skip: {save_file_name}")
+            return
         async with aiofiles.open(save_file_name, 'wb') as f:
             await f.write(video_content)
             utils.logger.info(f"[DouYinVideoStoreImplement.save_video] save video {save_file_name} success ...")
