@@ -295,16 +295,23 @@ class DouYinCrawler(AbstractCrawler):
 
     async def fetch_creator_video_detail(self, video_list: List[Dict]):
         """
-        Concurrently obtain the specified post list and save the data
-        """
-        semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
-        task_list = [self.get_aweme_detail(post_item.get("aweme_id"), semaphore) for post_item in video_list]
+        Save aweme items returned by the creator posts list endpoint.
 
-        note_details = await asyncio.gather(*task_list)
-        for aweme_item in note_details:
-            if aweme_item is not None:
-                await douyin_store.update_douyin_aweme(aweme_item=aweme_item)
-                await self.get_aweme_media(aweme_item=aweme_item)
+        2026-07-15 change: /aweme/v1/web/aweme/detail/ is now server-side blocked
+        for scraped clients (returns empty body → DataFetchError "account blocked").
+        The list endpoint /aweme/v1/web/aweme/post/ already returns full aweme
+        objects (including video.play_addr.url_list), so we skip the redundant
+        per-item detail fetch and consume list items directly.
+
+        Trade-off: list items may omit some enriched fields the detail endpoint
+        adds, but they contain everything douyin_store.update_douyin_aweme and
+        get_aweme_media need for saving metadata + downloading the mp4.
+        """
+        for aweme_item in video_list:
+            if aweme_item is None:
+                continue
+            await douyin_store.update_douyin_aweme(aweme_item=aweme_item)
+            await self.get_aweme_media(aweme_item=aweme_item)
 
     async def create_douyin_client(self, httpx_proxy: Optional[str]) -> DouYinClient:
         """Create douyin client"""
