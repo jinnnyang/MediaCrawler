@@ -288,8 +288,14 @@ class DouYinCrawler(AbstractCrawler):
             if creator_info:
                 await douyin_store.save_creator(user_id, creator=creator_info)
 
-            # Get all video information of the creator
-            all_video_list = await self.dy_client.get_all_user_aweme_posts(sec_user_id=user_id, callback=self.fetch_creator_video_detail)
+            # Get all video information of the creator.
+            # Honor CRAWLER_MAX_NOTES_COUNT so `--crawler_max_notes_count N`
+            # actually caps creator-mode runs (fixes long-standing no-op).
+            all_video_list = await self.dy_client.get_all_user_aweme_posts(
+                sec_user_id=user_id,
+                callback=self.fetch_creator_video_detail,
+                max_notes=config.CRAWLER_MAX_NOTES_COUNT,
+            )
 
             video_ids = [video_item.get("aweme_id") for video_item in all_video_list]
             await self.batch_get_note_comments(video_ids)

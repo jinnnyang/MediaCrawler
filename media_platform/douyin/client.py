@@ -21,7 +21,7 @@ import asyncio
 import copy
 import json
 import urllib.parse
-from typing import TYPE_CHECKING, Any, Callable, Dict, Union, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Union, Optional
 
 import httpx
 from playwright.async_api import BrowserContext
@@ -439,19 +439,44 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         }
         return await self.get(uri, params)
 
-    async def get_all_user_aweme_posts(self, sec_user_id: str, callback: Optional[Callable] = None):
+    async def get_all_user_aweme_posts(
+        self,
+        sec_user_id: str,
+        callback: Optional[Callable] = None,
+        max_notes: Optional[int] = None,
+    ):
+        """
+        Iterate every page of a creator's posts, feeding each page to callback.
+
+        max_notes: optional early-stop cap. When set to a positive int, stops
+        after that many awemes have been collected (the last page is truncated
+        so the callback receives at most the remaining budget). Values that are
+        None or <= 0 mean "no limit — walk until has_more == 0".
+        """
         posts_has_more = 1
         max_cursor = ""
-        result = []
+        result: List[Dict] = []
         while posts_has_more == 1:
             aweme_post_res = await self.get_user_aweme_posts(sec_user_id, max_cursor)
             posts_has_more = aweme_post_res.get("has_more", 0)
             max_cursor = aweme_post_res.get("max_cursor")
             aweme_list = aweme_post_res.get("aweme_list") if aweme_post_res.get("aweme_list") else []
+            # Early-stop: honor max_notes budget by truncating this page.
+            if max_notes and max_notes > 0:
+                remaining = max_notes - len(result)
+                if remaining <= 0:
+                    break
+                if len(aweme_list) > remaining:
+                    aweme_list = aweme_list[:remaining]
             utils.logger.info(f"[DouYinClient.get_all_user_aweme_posts] get sec_user_id:{sec_user_id} video len : {len(aweme_list)}")
             if callback:
                 await callback(aweme_list)
             result.extend(aweme_list)
+            if max_notes and max_notes > 0 and len(result) >= max_notes:
+                utils.logger.info(
+                    f"[DouYinClient.get_all_user_aweme_posts] reached max_notes={max_notes}, stopping early"
+                )
+                break
         return result
 
     async def get_aweme_media(self, url: str) -> Union[bytes, None]:

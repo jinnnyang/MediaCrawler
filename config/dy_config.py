@@ -40,7 +40,6 @@ DY_SPECIFIED_ID_LIST = [
 # 1. Complete creator homepage URL: "https://www.douyin.com/user/MS4wLjABAAAATJPY7LAlaa5X-c8uNdWkvz0jUGgpw4eeXIwu_8BhvqE?from_tab_name=main"
 # 2. sec_user_id: "MS4wLjABAAAATJPY7LAlaa5X-c8uNdWkvz0jUGgpw4eeXIwu_8BhvqE"
 DY_CREATOR_ID_LIST = [
-    "https://www.douyin.com/user/MS4wLjABAAAATJPY7LAlaa5X-c8uNdWkvz0jUGgpw4eeXIwu_8BhvqE?from_tab_name=main",
-    "MS4wLjABAAAATJPY7LAlaa5X-c8uNdWkvz0jUGgpw4eeXIwu_8BhvqE"
+    "https://www.douyin.com/user/MS4wLjABAAAA1IaCXuEoeZGeehsJczgJi8mHlIqJubxq0-ELkTIlIos",
     # ........................
 ]
